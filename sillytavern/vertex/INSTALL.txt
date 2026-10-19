@@ -1,0 +1,29 @@
+Vertex Native 1.1.0 — 前端扩展 + 服务端插件
+
+适配 SillyTavern 1.19.0。保活、Vertex 请求、函数参数解析、官方分段接续和诊断均由插件提供。
+
+在服务器的 SillyTavern 程序根目录运行：
+git clone https://github.com/Shalistera/Somethingother.git plugins/vertex-native
+
+将 config.yaml 中的 enableServerPlugins 设为 true，然后按原来的方式重启酒馆。插件使用酒馆已安装的依赖，无需另跑 npm install。
+
+在酒馆界面打开“扩展程序 → 安装扩展程序”，填入：
+https://github.com/Shalistera/Somethingother
+
+刷新页面，在“扩展程序 → Vertex Native”看到“服务端 1.1.0 已连接”即可。继续使用原来的 Google Vertex AI 连接、密钥、模型和区域；需要 Priority 时在新扩展内选择。初次加载会读取旧 Vertex patch 的同名设置。
+
+图灵脚本继续提供 actual_content 工具和提示词。启用“将图灵 actual_content 转为正文”后，由服务端解析正文，原脚本监视器可能仍显示 0 字；扩展的状态行会显示收到的正文数量。官方分段接续只处理 CONTINUATION；模型返回 STOP 时停止本轮。
+
+之前打过补丁的实例可以先安装插件；新扩展会把 Vertex 请求交给插件。确认连接后，可在酒馆根目录撤回旧源码补丁。每条 --check 成功后才执行紧随其后的应用命令；尚未装过对应补丁时跳过该组。
+git apply -R --check plugins/vertex-native/sillytavern/vertex-text.patch
+git apply -R plugins/vertex-native/sillytavern/vertex-text.patch
+git apply -R --check plugins/vertex-native/sillytavern/sillytavern-stream-debug.patch
+git apply -R plugins/vertex-native/sillytavern/sillytavern-stream-debug.patch
+
+最早的 vertex-function-argument-streaming.patch 可用原文件单独撤回，也可以保留。撤回后重启酒馆并刷新页面。旧保活插件可停用；本扩展直接连接 Vertex。
+
+诊断入口是扩展里的“断连诊断”，地址为 /api/plugins/vertex-native/debug。采集默认关闭，导出保留连接时序和计数。更新服务端用 git -C plugins/vertex-native pull，然后重启；前端从扩展管理界面更新并刷新。
+
+也可将发布的 ZIP 解压到酒馆程序根目录，一次安装两部分，再开启 enableServerPlugins 并重启；ZIP 安装的版本用新版 ZIP 覆盖更新。Docker 需放在实际运行的程序目录或对应持久化挂载中。
+
+核心逻辑来自已发布的 vertex-text.patch；Google 提示词转换适配自 SillyTavern。许可证见 ../LICENSE（GNU AGPL v3）。

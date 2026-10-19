@@ -1,0 +1,13 @@
+{
+  "display_name": "Vertex Native",
+  "loading_order": -100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "sillytavern/vertex/frontend/style.css",
+  "author": "Shalistera",
+  "version": "1.1.0",
+  "minimum_client_version": "1.19.0",
+  "homePage": "https://github.com/Shalistera/Somethingother",
+  "auto_update": false
+}
