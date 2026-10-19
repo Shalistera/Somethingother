@@ -1,0 +1,16 @@
+Vertex streaming patches for SillyTavern 1.19.0
+Base commit: 06bde939fb1e9c4c8d8641d810f0a916b5bce127
+Upstream: https://github.com/SillyTavern/SillyTavern
+Distributed under GNU AGPL v3; see LICENSE.
+
+Copy both .patch files into the SillyTavern application directory, then run:
+
+git apply --check sillytavern-stream-debug.patch
+git apply sillytavern-stream-debug.patch
+git apply --check vertex-text.patch
+git apply vertex-text.patch
+
+If the stream-debug patch is already installed, skip its two commands. If a check fails, stop before applying that patch.
+Restart SillyTavern and hard-refresh the browser. Open the Google Vertex AI connection settings to configure the new options.
+The actual_content option converts an existing tool call into chat text; keep the script or preset that defines that tool.
+The diagnostic page is available at /api/stream-debug after signing in.

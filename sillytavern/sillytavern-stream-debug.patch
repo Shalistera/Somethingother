@@ -1,0 +1,902 @@
+diff --git a/src/endpoints/backends/chat-completions.js b/src/endpoints/backends/chat-completions.js
+index 0d98c77f7..b0c422d5a 100644
+--- a/src/endpoints/backends/chat-completions.js
++++ b/src/endpoints/backends/chat-completions.js
+@@ -69,6 +69,7 @@ import {
+ import { getVertexAIAuth, getProjectIdFromServiceAccount } from '../google.js';
+ import { getCookieSecret } from '../../users.js';
+ import { fetchGoogleModels, GoogleModelsHttpError } from './google-models.js';
++import { streamDebug } from '../../diagnostics/gemini-stream-debug.js';
+ 
+ const API_OPENAI = 'https://api.openai.com/v1';
+ const API_CLAUDE = 'https://api.anthropic.com/v1';
+@@ -452,6 +453,7 @@ async function sendClaudeRequest(request, response) {
+  * @param {express.Response} response Express response
+  */
+ async function sendMakerSuiteRequest(request, response) {
++    const diagnostic = streamDebug.begin(request, response);
+     const useVertexAi = request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.VERTEXAI;
+     const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
+     let apiUrl;
+@@ -730,12 +732,14 @@ async function sendMakerSuiteRequest(request, response) {
+             url = `${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}?key=${apiKey}${stream ? '&alt=sse' : ''}`;
+         }
+ 
++        diagnostic?.startUpstream(url, body, headers, controller.signal);
+         const generateResponse = await fetch(url, {
+             body: JSON.stringify(body),
+             method: 'POST',
+             headers: headers,
+             signal: controller.signal,
+         });
++        diagnostic?.responseHeaders(generateResponse);
+ 
+         if (stream) {
+             try {
+@@ -785,6 +789,7 @@ async function sendMakerSuiteRequest(request, response) {
+             return response.send(reply);
+         }
+     } catch (error) {
++        diagnostic?.failure(error);
+         console.error(`Error communicating with ${apiName} API:`, error);
+         if (!response.headersSent) {
+             return response.status(500).send({ error: true });
+diff --git a/src/server-main.js b/src/server-main.js
+index bcf5bed8d..18e9d020a 100644
+--- a/src/server-main.js
++++ b/src/server-main.js
+@@ -73,6 +73,7 @@ import { init as settingsInit } from './endpoints/settings.js';
+ import { redirectDeprecatedEndpoints, ServerStartup, setupPrivateEndpoints } from './server-startup.js';
+ import { diskCache } from './endpoints/characters.js';
+ import { migrateFlatSecrets } from './endpoints/secrets.js';
++import { streamDebug } from './diagnostics/gemini-stream-debug.js';
+ import { migrateGroupChatsMetadataFormat } from './endpoints/groups.js';
+ 
+ // Work around a node v20.0.0, v20.1.0, and v20.2.0 bug. The issue was fixed in v20.3.0.
+@@ -246,6 +247,8 @@ app.use('/api/users', usersPublicRouter);
+ 
+ // Everything below this line requires authentication
+ app.use(requireLoginMiddleware);
++app.use('/api/stream-debug', streamDebug.router);
++app.use('/api/plugins/turing-stream-bridge/generate', streamDebug.bridgeMiddleware);
+ app.post('/api/ping', (request, response) => {
+     if (request.query.extend && request.session) {
+         request.session.touch = Date.now();
+diff --git a/src/diagnostics/gemini-stream-debug.js b/src/diagnostics/gemini-stream-debug.js
+new file mode 100644
+--- /dev/null
++++ b/src/diagnostics/gemini-stream-debug.js
+@@ -0,0 +1,479 @@
++import fs from 'node:fs';
++import path from 'node:path';
++import { randomBytes, randomUUID, createHmac } from 'node:crypto';
++import { performance } from 'node:perf_hooks';
++import { StringDecoder } from 'node:string_decoder';
++import { fileURLToPath } from 'node:url';
++import express from 'express';
++
++const PATCH_VERSION = '1.0.0';
++const HOUR = 60 * 60 * 1000;
++const MAX_RECORDS = 40;
++const MAX_ACTIVE = 12;
++const MAX_EVENTS = 180;
++const MAX_EVENT_CHARS = 256 * 1024;
++const packageVersion = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
++const enumValue = (value, values) => values.includes(value) ? value : 'other';
++const number = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
++const stringLength = value => typeof value === 'string' ? value.length : 0;
++const FINISH_REASONS = ['STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL', 'MODEL_ARMOR', 'FINISH_REASON_UNSPECIFIED'];
++const CODES = ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_STREAM_DESTROYED', 'ABORT_ERR', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ENOENT', 'EACCES', 'EROFS', 'ENOSPC'];
++
++// Deliberately omit raw error messages/stacks: node-fetch messages can contain API URLs and keys.
++export function safeError(error) {
++    const message = String(error?.message ?? '');
++    const kind = /socket hang up/i.test(message) ? 'socket_hang_up'
++        : /premature close/i.test(message) ? 'premature_close'
++            : /abort/i.test(message) ? 'aborted'
++                : /timeout|timed out|deadline/i.test(message) ? 'timeout' : 'other';
++    return { kind, code: enumValue(error?.code, CODES),
++        name: enumValue(error?.name, ['Error', 'FetchError', 'AbortError', 'TypeError']),
++        causeCode: error?.cause ? enumValue(error.cause.code, CODES) : null };
++}
++
++function protocolStats() {
++    return { events: 0, comments: 0, bridgeHeartbeats: 0, jsonErrors: 0, oversizedEvents: 0,
++        functionCalls: 0, partialArgs: 0, textChars: 0, nonWhitespaceTextChars: 0,
++        thoughtChars: 0, argumentContentChars: 0, nonWhitespaceArgumentChars: 0,
++        doneMarker: false, finishReasons: [], blockReasons: [], apiErrors: [], usage: {} };
++}
++
++/** Bounded, transient parsing. Only counts and allowlisted enums enter the report. */
++export class ProtocolCounter {
++    constructor(stats = protocolStats(), onSignal = () => {}) {
++        this.stats = stats;
++        this.onSignal = onSignal;
++        this.decoder = new StringDecoder('utf8');
++        this.buffer = '';
++        this.skipping = false;
++    }
++
++    payload(value) {
++        if (!value || typeof value !== 'object') return;
++        const s = this.stats;
++        if (value.error) {
++            const error = value.error;
++            const item = { status: enumValue(error.status,
++                ['CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DEADLINE_EXCEEDED', 'NOT_FOUND', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'INTERNAL', 'UNAVAILABLE', 'UNAUTHENTICATED']),
++            ...safeError(error) };
++            // Preserve the numeric API code separately from the transport code.
++            item.httpCode = number(error.code);
++            if (s.apiErrors.length < 8) s.apiErrors.push(item);
++            this.onSignal('api_error', item);
++        }
++        if (value.promptFeedback?.blockReason) {
++            const reason = enumValue(value.promptFeedback.blockReason, FINISH_REASONS);
++            if (!s.blockReasons.includes(reason)) s.blockReasons.push(reason);
++        }
++        for (const candidate of Array.isArray(value.candidates) ? value.candidates : []) {
++            if (candidate.finishReason) {
++                const reason = enumValue(candidate.finishReason, FINISH_REASONS);
++                if (!s.finishReasons.includes(reason)) {
++                    s.finishReasons.push(reason);
++                    this.onSignal('model_finish', { reason });
++                }
++            }
++            for (const part of Array.isArray(candidate.content?.parts) ? candidate.content.parts : []) {
++                if (part.thought) s.thoughtChars += stringLength(part.text);
++                else if (typeof part.text === 'string') {
++                    s.textChars += part.text.length;
++                    s.nonWhitespaceTextChars += part.text.trim().length;
++                }
++                if (part.functionCall) {
++                    s.functionCalls++;
++                    const call = part.functionCall;
++                    if (typeof call.args?.content === 'string') {
++                        s.argumentContentChars += call.args.content.length;
++                        s.nonWhitespaceArgumentChars += call.args.content.trim().length;
++                    }
++                    for (const arg of Array.isArray(call.partialArgs) ? call.partialArgs : []) {
++                        s.partialArgs++;
++                        if (arg.jsonPath === '$.content' && typeof arg.stringValue === 'string') {
++                            s.argumentContentChars += arg.stringValue.length;
++                            s.nonWhitespaceArgumentChars += arg.stringValue.trim().length;
++                        }
++                    }
++                }
++            }
++        }
++        const usage = value.usageMetadata;
++        if (usage) {
++            for (const key of ['promptTokenCount', 'candidatesTokenCount', 'totalTokenCount', 'thoughtsTokenCount', 'cachedContentTokenCount']) {
++                if (number(usage[key]) !== null) s.usage[key] = usage[key];
++            }
++            if (usage.trafficType) s.usage.trafficType = enumValue(usage.trafficType,
++                ['ON_DEMAND', 'ON_DEMAND_PRIORITY', 'ON_DEMAND_FLEX', 'PROVISIONED_THROUGHPUT']);
++        }
++    }
++
++    event(raw) {
++        if (!raw.trim()) return;
++        const lines = raw.split(/\r\n|\n|\r/);
++        this.stats.comments += lines.filter(line => line.startsWith(':')).length;
++        this.stats.bridgeHeartbeats += lines.filter(line => /^:\s*turing-bridge (?:connected|waiting)/.test(line)).length;
++        let payload = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
++        if (!payload && ['[', '{'].includes(raw.trimStart()[0])) payload = raw;
++        if (!payload) return;
++        this.stats.events++;
++        if (payload.trim() === '[DONE]') { this.stats.doneMarker = true; return; }
++        try { this.payload(JSON.parse(payload)); } catch { this.stats.jsonErrors++; }
++    }
++
++    push(chunk) {
++        const text = this.decoder.write(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
++        // Slice even a single huge network chunk so the diagnostic buffer is bounded.
++        for (let start = 0; start < text.length; start += 8192) {
++            this.buffer += text.slice(start, start + 8192);
++            let boundary;
++            while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(this.buffer))) {
++                if (!this.skipping) this.event(this.buffer.slice(0, boundary.index));
++                this.buffer = this.buffer.slice(boundary.index + boundary[0].length);
++                this.skipping = false;
++            }
++            if (this.buffer.length > MAX_EVENT_CHARS) {
++                if (!this.skipping) this.stats.oversizedEvents++;
++                this.skipping = true;
++                this.buffer = this.buffer.slice(-3);
++            }
++        }
++    }
++
++    end() {
++        this.buffer += this.decoder.end();
++        if (!this.skipping && this.buffer.trim()) this.event(this.buffer);
++        this.buffer = '';
++    }
++}
++
++function meter() {
++    return { bytes: 0, chunks: 0, firstByteMs: null, lastByteMs: null, maxGapMs: 0,
++        endedAtMs: null, closedAtMs: null, errors: [], protocol: protocolStats() };
++}
++
++class Trace {
++    constructor(owner, request, response, kind) {
++        this.owner = owner;
++        this.response = response;
++        this.start = performance.now();
++        this.observing = true;
++        this.cleanups = [];
++        this.record = { id: randomUUID(), runId: owner.store.runId, kind,
++            startedAt: new Date().toISOString(), elapsedMs: 0, state: 'in_progress', events: [],
++            request: { source: enumValue(request.body?.chat_completion_source, ['vertexai', 'makersuite']),
++                model: /^gemini[-_][a-z0-9._-]{1,80}$/i.test(request.body?.model) ? request.body.model : 'other',
++                stream: request.body?.stream === true,
++                actualContentTool: Boolean(request.body?.tools?.some(t => t.function?.name === 'actual_content')),
++                toolsCount: request.body?.tools?.length ?? 0,
++                messagesCount: request.body?.messages?.length ?? 0,
++                maxTokens: number(request.body?.max_tokens),
++                reasoningEffort: enumValue(request.body?.reasoning_effort, ['auto', 'min', 'minimal', 'low', 'medium', 'high', 'max']),
++                partialArgsRequestedByScript: request.body?.stream_function_call_arguments === true,
++                reverseProxyConfigured: Boolean(request.body?.reverse_proxy) },
++            localTimeouts: { socketMs: number(request.socket?.timeout),
++                serverRequestMs: number(request.socket?.server?.requestTimeout),
++                serverHeadersMs: number(request.socket?.server?.headersTimeout),
++                serverKeepAliveMs: number(request.socket?.server?.keepAliveTimeout) },
++            upstream: meter(), downstream: meter() };
++        // Same body can occur in retries: this groups equivalent requests, not unique parentage.
++        this.record.bodyGroup = createHmac('sha256', owner.store.groupKey).update(owner.root + '\0').update(JSON.stringify(request.body ?? {})).digest('hex').slice(0, 20);
++        this.upstreamParser = new ProtocolCounter(this.record.upstream.protocol, (event, detail) => this.event(event, detail));
++        this.downstreamParser = new ProtocolCounter(this.record.downstream.protocol);
++        response.setHeader('X-ST-Stream-Debug-Id', this.record.id);
++        const write = response.write;
++        const end = response.end;
++        const self = this;
++        function observedWrite(chunk, ...args) {
++            if (self.observing) self.data('downstream', chunk);
++            return write.call(this, chunk, ...args);
++        }
++        function observedEnd(chunk, ...args) {
++            if (self.observing && (typeof chunk === 'string' || Buffer.isBuffer(chunk) || chunk instanceof Uint8Array)) self.data('downstream', chunk);
++            return end.call(this, chunk, ...args);
++        }
++        response.write = observedWrite;
++        response.end = observedEnd;
++        this.cleanups.push(() => {
++            if (response.write === observedWrite) response.write = write;
++            if (response.end === observedEnd) response.end = end;
++        });
++        this.listen(response, 'finish', () => {
++            this.record.downstream.endedAtMs = this.ms();
++            this.record.downstream.httpStatus = response.statusCode;
++            this.downstreamParser.end();
++            this.event('downstream_finish', { status: response.statusCode });
++        });
++        this.listen(response, 'close', () => {
++            this.record.downstream.closedAtMs = this.ms();
++            this.record.downstream.finished = response.writableFinished;
++            this.event('downstream_close', { finished: response.writableFinished });
++            // Keep listeners briefly so cancellation from the native handler is captured.
++            const timer = setTimeout(() => this.detach('response_closed'), 250);
++            timer.unref?.();
++            this.cleanups.push(() => clearTimeout(timer));
++        });
++        this.listen(response, 'error', error => this.failure(error, 'downstream'));
++        this.listen(request, 'aborted', () => this.event('incoming_request_aborted'));
++        const pulse = setInterval(() => { this.event('sample', this.sample()); }, 10000);
++        const lifetime = setTimeout(() => this.detach('capture_window_ended'), HOUR);
++        pulse.unref?.(); lifetime.unref?.();
++        this.cleanups.push(() => clearInterval(pulse), () => clearTimeout(lifetime));
++        this.event('request_start');
++    }
++
++    ms() { return Math.round(performance.now() - this.start); }
++
++    listen(emitter, name, fn) {
++        emitter.on(name, fn);
++        this.cleanups.push(() => emitter.removeListener(name, fn));
++    }
++
++    event(type, detail = {}) {
++        if (!this.observing) return;
++        const events = this.record.events;
++        if (events.length >= MAX_EVENTS) events.splice(1, 1);
++        events.push({ atMs: this.ms(), type, ...detail });
++        this.owner.store.schedule(this.owner);
++    }
++
++    sample() {
++        const now = this.ms();
++        const up = this.record.upstream;
++        return { upstreamBytes: up.bytes, downstreamBytes: this.record.downstream.bytes,
++            upstreamIdleMs: now - (up.lastByteMs ?? this.record.fetchStartedAtMs ?? 0),
++            downstreamOpen: !this.response.destroyed && !this.response.writableEnded };
++    }
++
++    data(side, chunk) {
++        if (!this.observing || chunk == null || typeof chunk === 'function') return;
++        const bytes = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
++        if (!bytes) return;
++        const m = this.record[side];
++        const ms = this.ms();
++        const previous = m.lastByteMs ?? (side === 'upstream' ? this.record.fetchStartedAtMs ?? 0 : 0);
++        m.maxGapMs = Math.max(m.maxGapMs, ms - previous);
++        m.bytes += bytes; m.chunks++; m.lastByteMs = ms;
++        if (m.firstByteMs === null) { m.firstByteMs = ms; this.event(side + '_first_byte'); }
++        try { (side === 'upstream' ? this.upstreamParser : this.downstreamParser).push(chunk); } catch { this.record.observerParseError = true; }
++    }
++
++    startUpstream(url, body, headers, signal) {
++        if (!this.observing) return;
++        const parsed = new URL(url);
++        this.record.fetchStartedAtMs = this.ms();
++        const names = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
++        this.record.effectiveRequest = {
++            endpoint: /^(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com$/.test(parsed.hostname) ? 'google_vertex'
++                : parsed.hostname === 'generativelanguage.googleapis.com' ? 'google_ai_studio' : 'custom_endpoint',
++            tls: parsed.protocol === 'https:',
++            streamFunctionCallArguments: body.toolConfig?.functionCallingConfig?.streamFunctionCallArguments === true,
++            thinkingConfigPresent: Boolean(body.generationConfig?.thinkingConfig),
++            thinkingBudget: number(body.generationConfig?.thinkingConfig?.thinkingBudget),
++            thinkingLevel: enumValue(body.generationConfig?.thinkingConfig?.thinkingLevel, ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'minimal', 'low', 'medium', 'high']),
++            priorityHeader: enumValue(names['x-vertex-ai-llm-shared-request-type'] ?? 'absent', ['absent', 'standard', 'priority', 'flex']),
++            requestTypeHeader: enumValue(names['x-vertex-ai-llm-request-type'] ?? 'absent', ['absent', 'shared', 'dedicated']),
++        };
++        const aborted = () => {
++            this.record.signalAbortedAtMs = this.ms();
++            this.event('abort_signal', { downstreamClosed: this.response.destroyed });
++        };
++        signal?.addEventListener('abort', aborted, { once: true });
++        this.cleanups.push(() => signal?.removeEventListener('abort', aborted));
++        this.event('upstream_fetch_start');
++    }
++
++    responseHeaders(response) {
++        if (!this.observing) return;
++        this.record.upstream.headersAtMs = this.ms();
++        this.record.upstream.httpStatus = response.status;
++        const contentType = response.headers.get('content-type') ?? '';
++        this.record.upstream.contentType = /event-stream/i.test(contentType) ? 'sse' : /json/i.test(contentType) ? 'json' : /html/i.test(contentType) ? 'html' : 'other';
++        this.event('upstream_headers', { status: response.status });
++        if (!response.body) return;
++        this.listen(response.body, 'data', chunk => this.data('upstream', chunk));
++        this.listen(response.body, 'end', () => {
++            this.record.upstream.endedAtMs = this.ms();
++            this.upstreamParser.end();
++            this.event('upstream_end');
++        });
++        this.listen(response.body, 'close', () => {
++            this.record.upstream.closedAtMs = this.ms();
++            this.event('upstream_close', { readableEnded: response.body.readableEnded === true });
++        });
++        this.listen(response.body, 'error', error => this.failure(error, 'upstream'));
++    }
++
++    failure(error, side = 'fetch') {
++        if (!this.observing) return;
++        const item = { atMs: this.ms(), side, ...safeError(error), ...this.sample() };
++        const target = side === 'downstream' ? this.record.downstream : this.record.upstream;
++        if (target.errors.length < 8) target.errors.push(item);
++        this.event('error', item);
++    }
++
++    snapshot(withEvents = true) {
++        const row = structuredClone(this.record);
++        row.elapsedMs = this.observing ? this.ms() : this.record.elapsedMs;
++        const up = row.upstream;
++        row.upstreamIdleMs = (up.endedAtMs ?? up.closedAtMs ?? row.elapsedMs) - (up.lastByteMs ?? row.fetchStartedAtMs ?? 0);
++        row.downstreamOpen = this.observing && !this.response.destroyed && !this.response.writableEnded;
++        row.state = up.errors.length ? 'upstream_error'
++            : row.downstream.errors.length ? 'downstream_error'
++                : up.httpStatus >= 400 ? 'upstream_http_error'
++                    : row.downstream.httpStatus >= 400 ? 'local_http_error'
++                        : row.downstream.closedAtMs !== null && !row.downstream.finished ? 'downstream_closed_early'
++                            : row.downstream.endedAtMs !== null ? 'response_finished' : 'in_progress';
++        if (!withEvents) delete row.events;
++        return row;
++    }
++
++    detach(reason) {
++        if (!this.observing) return;
++        this.event('capture_end', { reason });
++        this.record.elapsedMs = this.ms();
++        this.observing = false;
++        this.upstreamParser.buffer = ''; this.downstreamParser.buffer = '';
++        this.cleanups.splice(0).forEach(fn => fn());
++        this.owner.store.schedule(this.owner);
++    }
++}
++
++export class StreamDebugStore {
++    constructor({ persist = true } = {}) {
++        this.persist = persist;
++        this.runId = randomUUID();
++        this.groupKey = randomBytes(32);
++        this.users = new Map();
++        this.router = express.Router();
++        this.router.use((req, res, next) => {
++            if (!req.user?.directories?.root) return res.sendStatus(401);
++            res.set('Cache-Control', 'no-store');
++            next();
++        });
++        this.router.get('/', (_req, res) => res.sendFile(fileURLToPath(new URL('gemini-stream-debug.html', import.meta.url))));
++        this.router.get('/status', (req, res) => res.json(this.report(req, false)));
++        this.router.get('/export', (req, res) => {
++            res.attachment('sillytavern-stream-debug.json').type('json').send(JSON.stringify(this.report(req), null, 2));
++        });
++        this.router.post('/control', (req, res) => {
++            if (!['start', 'stop', 'clear'].includes(req.body?.action)) return res.sendStatus(400);
++            this.control(req, req.body.action);
++            res.json(this.report(req, false));
++        });
++    }
++
++    owner(request) {
++        const root = request.user?.directories?.root;
++        if (!root) return null;
++        if (this.users.has(root)) return this.users.get(root);
++        const owner = { store: this, root, until: 0, traces: [], restored: [], skipped: 0,
++            timer: null, saving: null, dirty: false, diskError: null };
++        owner.file = path.join(root, 'stream-debug', 'latest.json');
++        if (this.persist) {
++            try {
++                if (fs.statSync(owner.file).size <= 4 * 1024 * 1024) {
++                    const previous = JSON.parse(fs.readFileSync(owner.file, 'utf8'));
++                    if (previous.schema === 'sillytavern-stream-debug/1' && Array.isArray(previous.traces)) {
++                        owner.restored = previous.traces.slice(-MAX_RECORDS).map(row => ({ ...row, restoredAfterRestart: true, downstreamOpen: false }));
++                    }
++                }
++            } catch { /* A missing previous report is normal. */ }
++        }
++        this.users.set(root, owner);
++        return owner;
++    }
++
++    control(request, action) {
++        const owner = this.owner(request);
++        if (!owner) return;
++        if (action === 'start') owner.until = Date.now() + HOUR;
++        if (action === 'stop') owner.until = 0;
++        if (action === 'clear') {
++            owner.traces.forEach(trace => trace.detach('cleared'));
++            owner.traces = []; owner.restored = []; owner.skipped = 0;
++        }
++        this.schedule(owner);
++    }
++
++    begin(request, response, kind = 'native-gemini') {
++        if (request.body?.stream !== true || !['vertexai', 'makersuite'].includes(request.body?.chat_completion_source)) return null;
++        // Do not read diagnostic files or allocate per-user state until the UI was opened.
++        const owner = this.users.get(request.user?.directories?.root);
++        if (!owner || owner.until <= Date.now()) return null;
++        if (owner.traces.filter(t => t.observing).length >= MAX_ACTIVE) { owner.skipped++; return null; }
++        if (owner.traces.length >= MAX_RECORDS) {
++            const completed = owner.traces.findIndex(t => !t.observing);
++            if (completed >= 0) owner.traces.splice(completed, 1);
++        }
++        const trace = new Trace(owner, request, response, kind);
++        owner.traces.push(trace);
++        this.schedule(owner);
++        return trace;
++    }
++
++    bridgeMiddleware = (req, res, next) => {
++        if (req.method === 'POST') this.begin(req, res, 'keepalive-plugin');
++        next();
++    };
++
++    report(request, withEvents = true) {
++        const owner = this.owner(request);
++        if (!owner) return null;
++        return this.ownerReport(owner, withEvents);
++    }
++
++    ownerReport(owner, withEvents = true) {
++        const restored = owner.restored.map(row => {
++            const copy = structuredClone(row);
++            if (!withEvents) delete copy.events;
++            return copy;
++        });
++        return { schema: 'sillytavern-stream-debug/1', patchVersion: PATCH_VERSION,
++            generatedAt: new Date().toISOString(), runId: this.runId,
++            server: { sillyTavern: packageVersion, node: process.version, platform: process.platform },
++            recording: owner.until > Date.now(), recordingUntil: owner.until ? new Date(owner.until).toISOString() : null,
++            skippedRequests: owner.skipped, persistenceError: owner.diskError,
++            semantics: { downstreamBytes: 'bytes offered to Node response; not confirmation of browser receipt',
++                bodyGroup: 'ephemeral keyed hash of request body; equal bodies may be separate retries',
++                upstreamIdleMs: 'time since last upstream bytes, or fetch start before first byte',
++                protocolCounts: 'observed occurrences; complete snapshots and partial args may overlap' },
++            traces: [...restored, ...owner.traces.map(t => t.snapshot(withEvents))].slice(-MAX_RECORDS) };
++    }
++
++    schedule(owner) {
++        if (!this.persist) return;
++        owner.dirty = true;
++        if (owner.timer || owner.saving) return;
++        owner.timer = setTimeout(() => { owner.timer = null; void this.flush(owner); }, 500);
++        owner.timer.unref?.();
++    }
++
++    async flush(owner) {
++        if (!this.persist) return;
++        if (owner.saving) { await owner.saving; return this.flush(owner); }
++        clearTimeout(owner.timer); owner.timer = null;
++        if (!owner.dirty) return;
++        owner.dirty = false;
++        const snapshot = JSON.stringify(this.ownerReport(owner));
++        owner.saving = (async () => {
++            try {
++                await fs.promises.mkdir(path.dirname(owner.file), { recursive: true });
++                const temp = owner.file + '.' + process.pid + '.tmp';
++                await fs.promises.writeFile(temp, snapshot, { mode: 0o600 });
++                await fs.promises.rename(temp, owner.file);
++                owner.diskError = null;
++            } catch (error) { owner.diskError = safeError(error).code; }
++        })();
++        await owner.saving;
++        owner.saving = null;
++        if (owner.dirty) this.schedule(owner);
++    }
++
++    async close() {
++        for (const owner of this.users.values()) {
++            owner.traces.forEach(t => t.detach('observer_closed'));
++            await this.flush(owner);
++        }
++    }
++}
++
++export const streamDebug = new StreamDebugStore();
+diff --git a/src/diagnostics/gemini-stream-debug.html b/src/diagnostics/gemini-stream-debug.html
+new file mode 100644
+--- /dev/null
++++ b/src/diagnostics/gemini-stream-debug.html
+@@ -0,0 +1,104 @@
++<!doctype html>
++<html lang="zh-CN">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>SillyTavern 断连诊断</title>
++<style>
++:root{color-scheme:dark;font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;background:#14171c;color:#e9edf4}
++body{max-width:1100px;margin:40px auto;padding:0 24px}h1{font-size:28px;margin-bottom:8px}p{color:#b7c2d3}
++.bar{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}button,a.button{font:inherit;border:1px solid #526079;border-radius:8px;background:#253044;color:#fff;padding:8px 16px;cursor:pointer;text-decoration:none}
++button:first-child{background:#315aab}button:disabled{opacity:.5;cursor:wait}button:focus-visible,a:focus-visible{outline:3px solid #b2ccff;outline-offset:3px}
++.box{background:#1e242d;border:1px solid #354154;border-radius:12px;padding:16px;margin-bottom:20px}#status{font-weight:600;color:#e5eefd}#error{color:#ffb7b7;white-space:pre-wrap}
++.scroll{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #354154;font-size:14px}th{color:#b7c2d3}td small{display:block;color:#a5b1c2}
++code{background:#252d38;padding:2px 5px;border-radius:4px}summary{cursor:pointer}li{margin:6px 0}#empty{padding:20px;color:#b7c2d3}.bad{color:#ffb7b7}.good{color:#98ddaf}
++</style>
++</head>
++<body>
++<h1>断连诊断</h1>
++<p>记录 Gemini / Vertex 流式请求，以及图灵保活插件的连接状态。</p>
++<div class="box">
++<div id="status" role="status" aria-live="polite">正在读取状态…</div>
++<div id="error" role="alert"></div>
++<div class="bar">
++<button type="button" data-action="start">开始记录（1 小时）</button>
++<button type="button" data-action="stop">停止新记录</button>
++<a class="button" id="download" download>下载诊断 JSON</a>
++<button type="button" data-action="clear">清空记录</button>
++</div>
++<div>点“开始记录” → 回到酒馆正常生成 → 空回或卡住后回到这里下载 JSON。</div>
++<p>卡住时可以先下载，再点酒馆的停止生成。这样能保留主动停止之前的状态。</p>
++</div>
++<div class="box scroll">
++<table><thead><tr><th>请求 / 时间</th><th>位置</th><th>状态</th><th>模型收到字节</th><th>模型静默</th><th>插件心跳写入</th></tr></thead><tbody id="rows"></tbody></table>
++<div id="empty">开始记录后，等待下一次生成。记录范围为原生 Gemini / Vertex 的流式请求。</div>
++</div>
++<details class="box"><summary>记录范围与读法</summary><ul>
++<li>“模型侧”读取渠道返回的数据；“保活插件”记录服务器向下游写出的数据。插件心跳写入次数不能证明浏览器已经收到。</li>
++<li>上游错误、HTTP 状态、首包时间、最后收包时间、结束原因和实际 Priority 请求头会进入报告。响应提供的 trafficType 也会保留。</li>
++<li>导出使用计数、时间和固定分类；API 密钥、Cookie、完整地址、提示词和聊天正文不进入报告。</li>
++<li>最多保留 40 条连接记录。图灵保活路径通常产生两条记录，可通过 bodyGroup 及时间对应；相同内容的重试也可能属于同组。</li>
++<li>记录按用户隔离，并保存到该用户数据目录的 stream-debug/latest.json。重启后需重新点“开始记录”。</li>
++<li>“停止新记录”让现有请求继续收集结束信息；“清空记录”同时停止观察现有请求。两者都保持生成连接原样。</li>
++<li>诊断不发送额外心跳、不重试请求、不调整超时，也不切换付费 Priority。</li>
++</ul></details>
++<script>
++'use strict';
++const base = location.pathname.replace(/\/$/, '');
++const prefix = base.slice(0, base.lastIndexOf('/api/stream-debug'));
++const statusNode = document.getElementById('status');
++const errorNode = document.getElementById('error');
++const rowsNode = document.getElementById('rows');
++document.getElementById('download').href = base + '/export';
++const labels = { in_progress: '进行中', upstream_error: '模型连接错误', downstream_error: '下游连接错误', upstream_http_error: '上游 HTTP 错误', local_http_error: '酒馆接口错误', downstream_closed_early: '下游提前断开', response_finished: '响应已结束' };
++let pending = false;
++function seconds(ms) { return (Math.max(0, ms ?? 0) / 1000).toFixed(1) + ' 秒'; }
++function render(report) {
++    statusNode.textContent = report.recording ? '正在记录 · ' + report.traces.length + ' 条连接' : '记录已停止 · ' + report.traces.length + ' 条连接';
++    if (report.persistenceError) errorNode.textContent = '保存到服务器失败：' + report.persistenceError + '。当前仍可直接下载内存中的报告。';
++    if (report.skippedRequests) errorNode.textContent += ' 并发记录已达上限，跳过 ' + report.skippedRequests + ' 次。';
++    rowsNode.replaceChildren();
++    for (const row of [...report.traces].reverse()) {
++        const tr = document.createElement('tr');
++        const values = [row.id.slice(0, 8) + ' · ' + new Date(row.startedAt).toLocaleTimeString(),
++            row.kind === 'native-gemini' ? '模型侧' : '保活插件',
++            row.restoredAfterRestart ? '上次运行的记录' : (labels[row.state] || row.state),
++            row.kind === 'native-gemini' ? String(row.upstream.bytes) : '—',
++            row.kind === 'native-gemini' ? seconds(row.upstreamIdleMs) : '—',
++            row.kind === 'keepalive-plugin' ? String(row.downstream.protocol.bridgeHeartbeats) : '—'];
++        for (const value of values) { const td = document.createElement('td'); td.textContent = value; tr.appendChild(td); }
++        const detail = document.createElement('small');
++        const errors = [...row.upstream.errors, ...row.downstream.errors];
++        detail.textContent = errors.length ? errors.map(e => e.code + ' / ' + e.kind).join(', ') : '已观察 ' + seconds(row.elapsedMs);
++        tr.children[2].appendChild(detail);
++        if (row.state.includes('error') || row.state.includes('early')) tr.children[2].className = 'bad';
++        rowsNode.appendChild(tr);
++    }
++    document.getElementById('empty').hidden = report.traces.length > 0;
++}
++async function refresh(action) {
++    if (pending) return;
++    pending = true;
++    document.querySelectorAll('button').forEach(b => { b.disabled = true; });
++    try {
++        errorNode.textContent = '';
++        let response;
++        if (action) {
++            const csrf = await fetch(prefix + '/csrf-token', { credentials: 'same-origin', cache: 'no-store' });
++            if (!csrf.ok) throw Error('读取登录校验失败：HTTP ' + csrf.status);
++            const token = (await csrf.json()).token;
++            response = await fetch(base + '/control', { method: 'POST', credentials: 'same-origin',
++                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token }, body: JSON.stringify({ action }) });
++        } else response = await fetch(base + '/status', { credentials: 'same-origin', cache: 'no-store' });
++        if (!response.ok) throw Error('诊断接口返回 HTTP ' + response.status + '，请确认已登录酒馆。');
++        render(await response.json());
++    } catch (error) { errorNode.textContent = error.message; }
++    finally { pending = false; document.querySelectorAll('button').forEach(b => { b.disabled = false; }); }
++}
++document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => refresh(button.dataset.action)));
++setInterval(() => { if (!document.hidden) refresh(); }, 5000);
++document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
++refresh();
++</script>
++</body>
++</html>
+diff --git a/tests/gemini-stream-debug.node.mjs b/tests/gemini-stream-debug.node.mjs
+new file mode 100644
+--- /dev/null
++++ b/tests/gemini-stream-debug.node.mjs
+@@ -0,0 +1,240 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import http from 'node:http';
++import { EventEmitter } from 'node:events';
++import { PassThrough } from 'node:stream';
++import test from 'node:test';
++import express from 'express';
++import fetch from 'node-fetch';
++import { ProtocolCounter, StreamDebugStore, safeError } from '../src/diagnostics/gemini-stream-debug.js';
++import { forwardFetchResponse } from '../src/util.js';
++
++const body = { stream: true, model: 'gemini-4-argon', chat_completion_source: 'vertexai', messages: [{ role: 'user', content: 'PROMPT_PRIVATE' }], tools: [{ type: 'function', function: { name: 'actual_content' } }] };
++const frame = obj => 'data: ' + JSON.stringify(obj) + '\n\n';
++const answer = text => ({ candidates: [{ content: { parts: [{ functionCall: { name: 'actual_content', args: { content: text } } }] }, finishReason: 'STOP' }] });
++const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
++
++function request(root = '/unused/user-a', overrides = {}) {
++    return Object.assign(new EventEmitter(), { user: { directories: { root } }, body: structuredClone(body), ...overrides });
++}
++function response() {
++    const res = new EventEmitter();
++    res.writes = []; res.headers = {}; res.statusCode = 200; res.destroyed = false; res.writableEnded = false; res.writableFinished = false;
++    res.setHeader = (key, value) => { res.headers[key] = value; };
++    res.write = function (chunk, ...args) { this.writes.push(chunk); const callback = args.at(-1); if (typeof callback === 'function') callback(); return false; };
++    res.end = function (chunk) { if (chunk) this.writes.push(chunk); this.writableEnded = this.writableFinished = true; this.emit('finish'); return this; };
++    return res;
++}
++function setup(t, options = { persist: false }) {
++    const store = new StreamDebugStore(options);
++    t.after(() => store.close());
++    return store;
++}
++function start(t) {
++    const store = setup(t); const req = request(); const res = response();
++    store.control(req, 'start');
++    const trace = store.begin(req, res);
++    return { store, req, res, trace };
++}
++
++test('off by default; non-Gemini and non-streaming requests keep their original response methods', t => {
++    const store = setup(t), req = request(), res = response(), write = res.write;
++    assert.equal(store.begin(req, res), null);
++    store.control(req, 'start');
++    assert.equal(store.begin(request(undefined, { body: { ...body, stream: false } }), res), null);
++    assert.equal(store.begin(request(undefined, { body: { ...body, chat_completion_source: 'openai' } }), res), null);
++    assert.equal(res.write, write);
++});
++
++test('response wrappers preserve bytes, return values, callbacks and backpressure', t => {
++    const { res, trace } = start(t);
++    const bytes = Buffer.from(frame(answer('中文🙂')));
++    let callbackCount = 0;
++    assert.equal(res.write(bytes, () => { callbackCount++; }), false);
++    assert.equal(callbackCount, 1);
++    assert.equal(res.end('TAIL'), res);
++    assert.equal(Buffer.concat(res.writes.map(x => Buffer.from(x))).toString(), bytes.toString() + 'TAIL');
++    assert.equal(trace.snapshot().downstream.bytes, bytes.length + 4);
++});
++
++test('protocol counters handle every UTF-8/SSE byte boundary without keeping content', () => {
++    const counter = new ProtocolCounter();
++    const input = Buffer.from(': turing-bridge waiting\r\n\r\n' + frame(answer('中文🙂PRIVATE')) + frame({ usageMetadata: { trafficType: 'ON_DEMAND_PRIORITY', thoughtsTokenCount: 88 } }) + 'data: [DONE]\n\n');
++    for (const byte of input) counter.push(Buffer.from([byte]));
++    counter.end();
++    assert.equal(counter.stats.bridgeHeartbeats, 1);
++    assert.equal(counter.stats.argumentContentChars, '中文🙂PRIVATE'.length);
++    assert.deepEqual(counter.stats.finishReasons, ['STOP']);
++    assert.equal(counter.stats.usage.trafficType, 'ON_DEMAND_PRIORITY');
++    assert.equal(counter.stats.doneMarker, true);
++    assert.ok(!JSON.stringify(counter.stats).includes('PRIVATE'));
++    assert.equal(counter.buffer, '');
++});
++
++test('oversized events are bounded; following valid events are still counted', () => {
++    const counter = new ProtocolCounter();
++    counter.push(frame(answer('X'.repeat(400000))) + frame({ candidates: [{ finishReason: 'MAX_TOKENS' }] }));
++    counter.end();
++    assert.equal(counter.stats.oversizedEvents, 1);
++    assert.ok(counter.stats.finishReasons.includes('MAX_TOKENS'));
++    assert.equal(counter.buffer.length, 0);
++});
++
++test('private headers, URLs, messages, stacks and content never enter exported diagnostics', t => {
++    const { store, req, trace } = start(t);
++    trace.startUpstream('https://aiplatform.googleapis.com/v1/projects/PROJECT_PRIVATE?key=KEY_PRIVATE',
++        { generationConfig: {}, toolConfig: { functionCallingConfig: { streamFunctionCallArguments: true } } },
++        { Authorization: 'Bearer KEY_PRIVATE', Cookie: 'COOKIE_PRIVATE', 'X-Vertex-AI-LLM-Shared-Request-Type': 'priority' }, new AbortController().signal);
++    trace.data('upstream', Buffer.from(frame(answer('CHAT_PRIVATE'))));
++    trace.failure(Object.assign(new Error('request https://PRIVATE.invalid?key=KEY_PRIVATE failed: socket hang up'), { code: 'ECONNRESET', stack: 'STACK_PRIVATE' }));
++    const report = store.report(req);
++    assert.equal(report.traces[0].effectiveRequest.priorityHeader, 'priority');
++    assert.equal(report.traces[0].upstream.errors[0].kind, 'socket_hang_up');
++    assert.ok(!JSON.stringify(report).includes('PRIVATE'));
++});
++
++test('response-body errors are captured while the downstream can remain open', t => {
++    const { trace } = start(t);
++    const remote = new PassThrough();
++    trace.responseHeaders({ status: 200, headers: new Map([['content-type', 'text/event-stream']]), body: remote });
++    remote.write(frame({ usageMetadata: { thoughtsTokenCount: 1 } }));
++    remote.emit('error', Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
++    const row = trace.snapshot();
++    assert.equal(row.state, 'upstream_error');
++    assert.equal(row.downstreamOpen, true);
++    assert.ok(row.upstream.bytes > 0);
++    assert.equal(row.upstream.protocol.argumentContentChars, 0);
++});
++
++test('abort timing and downstream closure are separate from upstream network failure', t => {
++    const { trace, res } = start(t), controller = new AbortController();
++    trace.startUpstream('https://aiplatform.googleapis.com/', {}, {}, controller.signal);
++    res.destroyed = true; res.emit('close'); controller.abort();
++    trace.failure(Object.assign(new Error('aborted'), { name: 'AbortError', code: 'ABORT_ERR' }));
++    const row = trace.snapshot();
++    assert.equal(row.downstream.finished, false);
++    assert.ok(row.events.some(e => e.type === 'abort_signal' && e.downstreamClosed));
++    assert.equal(row.upstream.errors[0].kind, 'aborted');
++});
++
++test('same-body plugin/native requests have distinct IDs and matching bodyGroup; accounts are isolated', t => {
++    const store = setup(t), a = request(), b = request('/unused/user-b');
++    store.control(a, 'start');
++    const first = store.begin(a, response(), 'keepalive-plugin');
++    const second = store.begin(a, response());
++    assert.notEqual(first.record.id, second.record.id);
++    assert.equal(first.record.bodyGroup, second.record.bodyGroup);
++    assert.equal(store.report(b).traces.length, 0);
++    assert.equal(store.report(b).recording, false);
++});
++
++test('stop preserves current collection; clear detaches without aborting generation', t => {
++    const { store, req, res, trace } = start(t);
++    store.control(req, 'stop');
++    assert.equal(store.begin(req, response()), null);
++    assert.equal(trace.observing, true);
++    store.control(req, 'clear');
++    assert.equal(trace.observing, false);
++    assert.equal(res.destroyed, false);
++    assert.equal(res.writableEnded, false);
++    assert.equal(store.report(req).traces.length, 0);
++});
++
++test('concurrency cap bounds hanging observations and exposes skipped count', t => {
++    const store = setup(t), req = request(); store.control(req, 'start');
++    for (let i = 0; i < 20; i++) store.begin(request(), response());
++    assert.equal(store.report(req).traces.length, 12);
++    assert.equal(store.report(req).skippedRequests, 8);
++});
++
++test('private report persists and is recovered after restart with recording disabled', async t => {
++    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'st-stream-debug-test-'));
++    const store = new StreamDebugStore(); const req = request(root);
++    t.after(async () => { await store.close(); fs.rmSync(root, { recursive: true, force: true }); });
++    store.control(req, 'start'); const trace = store.begin(req, response());
++    trace.failure(Object.assign(new Error('SECRET_PRIVATE socket hang up'), { code: 'ECONNRESET' }));
++    await store.flush(store.owner(req));
++    const disk = fs.readFileSync(path.join(root, 'stream-debug/latest.json'), 'utf8');
++    assert.ok(!disk.includes('PRIVATE'));
++    const restarted = new StreamDebugStore();
++    const report = restarted.report(req);
++    assert.equal(report.recording, false);
++    assert.equal(report.traces.length, 1);
++    assert.equal(report.traces[0].restoredAfterRestart, true);
++    await restarted.close();
++});
++
++test('arbitrary error codes and cause text are excluded', () => {
++    const result = safeError({ name: 'PRIVATE', code: 'PRIVATE', message: 'PRIVATE', cause: { code: 'PRIVATE' } });
++    assert.ok(!JSON.stringify(result).includes('PRIVATE'));
++});
++
++async function listen(t, app) {
++    const server = http.createServer(app);
++    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
++    t.after(() => { server.closeAllConnections(); server.close(); });
++    return `http://127.0.0.1:${server.address().port}`;
++}
++
++test('real TCP socket hang-up is exported despite the native HTTP 500 losing details', async t => {
++    const store = setup(t), reqOwner = request(); store.control(reqOwner, 'start');
++    const upstream = await listen(t, (req, _res) => req.socket.destroy());
++    const app = express(); app.use(express.json()); app.use((req, _res, next) => { req.user = reqOwner.user; next(); });
++    app.use('/api/stream-debug', store.router);
++    app.post('/generate', async (req, res) => {
++        const trace = store.begin(req, res);
++        trace.startUpstream(upstream, {}, {}, new AbortController().signal);
++        try { const remote = await fetch(upstream); trace.responseHeaders(remote); await forwardFetchResponse(remote, res); }
++        catch (error) { trace.failure(error); res.status(500).json({ error: true }); }
++    });
++    const base = await listen(t, app);
++    const result = await fetch(base + '/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
++    assert.equal(result.status, 500); assert.deepEqual(await result.json(), { error: true });
++    const report = await (await fetch(base + '/api/stream-debug/export')).json();
++    assert.equal(report.traces[0].upstream.errors[0].code, 'ECONNRESET');
++    assert.equal(report.traces[0].upstream.errors[0].kind, 'socket_hang_up');
++    assert.equal(report.traces[0].upstream.bytes, 0);
++});
++
++test('actual native forwarder midstream disconnect is recorded before a client stop', async t => {
++    const store = setup(t), owner = request(); store.control(owner, 'start');
++    const upstream = await listen(t, (req, res) => {
++        res.writeHead(200, { 'content-type': 'text/event-stream' });
++        res.write(frame({ usageMetadata: { thoughtsTokenCount: 1 } }));
++        setTimeout(() => req.socket.destroy(), 40);
++    });
++    const app = express(); app.use(express.json()); app.use((req, _res, next) => { req.user = owner.user; next(); });
++    app.post('/generate', async (req, res) => {
++        const trace = store.begin(req, res), controller = new AbortController();
++        req.socket.on('close', () => controller.abort());
++        trace.startUpstream(upstream, {}, {}, controller.signal);
++        try { const remote = await fetch(upstream, { signal: controller.signal }); trace.responseHeaders(remote); await forwardFetchResponse(remote, res); }
++        catch (error) { trace.failure(error); if (!res.headersSent) res.status(500).json({ error: true }); }
++    });
++    const base = await listen(t, app), controller = new AbortController();
++    const response = await fetch(base + '/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal });
++    response.body.on('error', () => {}); response.body.resume();
++    await sleep(120);
++    const row = store.report(owner).traces[0];
++    assert.equal(row.state, 'upstream_error');
++    assert.equal(row.downstreamOpen, true);
++    assert.equal(row.signalAbortedAtMs, undefined);
++    assert.equal(row.upstream.protocol.argumentContentChars, 0);
++    controller.abort();
++});
++
++test('diagnostic routes require user context, validate actions and serve a usable page', async t => {
++    const store = setup(t), app = express(); app.use(express.json());
++    app.use((req, _res, next) => { if (req.headers['x-test-user']) req.user = request().user; next(); });
++    app.use('/api/stream-debug', store.router);
++    const base = await listen(t, app);
++    assert.equal((await fetch(base + '/api/stream-debug/export')).status, 401);
++    const headers = { 'x-test-user': '1', 'content-type': 'application/json' };
++    const page = await fetch(base + '/api/stream-debug', { headers });
++    assert.match(await page.text(), /下载诊断 JSON/);
++    assert.equal((await fetch(base + '/api/stream-debug/control', { method: 'POST', headers, body: '{"action":"bad"}' })).status, 400);
++    const result = await fetch(base + '/api/stream-debug/control', { method: 'POST', headers, body: '{"action":"start"}' });
++    assert.equal((await result.json()).recording, true);
++});
